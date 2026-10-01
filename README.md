@@ -30,7 +30,7 @@ You can give the binary any name. Custom names help distinguish binaries that us
 
 ```bash
 ./bin/[BINARY] -warmup_instructions [N_WARM] -simulation_instructions [N_SIM] -traces [TRACE_DIR]/[TRACE]
-./bin/hashed_perceptron-no-no-no-no-no-no-no-lru-lru-lru-lru-lru-lru-lru-lru-1core-baseline -warmup_instructions 25000000 -simulation_instructions 25000000 -traces ../traces/trace1.champsimtrace.xz
+./bin/baseline -warmup_instructions 250000 -simulation_instructions 250000 -traces ./traces/Trace1-001_.gz
 ```
 
 Where:
