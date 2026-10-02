@@ -1,16 +1,230 @@
 #include "cache.h"
+#include<iostream>
+
+
+#define DEGREE_MIN       1
+#define DEGREE_MAX       6
+#define DEGREE_INIT      3
+
+#define UNIFORM_THRESHOLD_INIT   3
+#define THRESHOLD_MIN 2
+#define THRESHOLD_MAX 5
+
+
+
+#define ACC_HIGH         70         // % -> increase degree
+#define ACC_LOW          40         // % -> decrease degree
+
+#define ACC_WINDOW       500
+
+#define IP_TRACKER_COUNT 32
+#define MASK_IP 0xFF
+
+
+int PREFETCH_DEGREE;
+int UNIFORM_THRESHOLD;
+uint64_t prefetch_issued = 0;
+uint64_t prefetch_useful = 0;
+
+class IP_TRACKER {
+public:
+    // the IP we're tracking
+    uint64_t ip;
+
+    // the last address accessed by this IP
+    uint64_t last_cl_addr;
+
+    // the stride between the last two addresses accessed by this IP
+    int64_t last_stride;
+
+    // the stride between the last two addresses accessed by this IP
+    int64_t uniform_stride;
+
+    // the confidence rate of uniform prefetcher for this IP
+    int uniform_confidence;
+
+    //is it in uniform or non-uniform state 0 => Unknown, 1 => Uniform, 2 => Non-Uniform
+    int state;
+
+    // use LRU to evict old IP trackers
+    uint32_t lru;
+
+    IP_TRACKER() {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        lru = 0;
+        uniform_confidence=0;
+        state=0;
+        uniform_stride=-1;
+    };
+};
+
+IP_TRACKER trackers[IP_TRACKER_COUNT];
+
+
+void CACHE::update_prefetch_degree()
+{
+    if (prefetch_issued < ACC_WINDOW)
+        return;
+
+    double accuracy =
+        (100.0 * prefetch_useful) / prefetch_issued;
+
+    if (accuracy > ACC_HIGH) {
+        if (PREFETCH_DEGREE < DEGREE_MAX)
+            PREFETCH_DEGREE++;
+        if (UNIFORM_THRESHOLD > THRESHOLD_MIN)
+            UNIFORM_THRESHOLD--;
+    }
+    else if (accuracy < ACC_LOW) {
+        if (PREFETCH_DEGREE > DEGREE_MIN)
+            PREFETCH_DEGREE--;
+        if (UNIFORM_THRESHOLD < THRESHOLD_MAX)
+            UNIFORM_THRESHOLD++;
+    }
+
+    cout << "SPP Accuracy: " << accuracy
+         << "% Degree: " << PREFETCH_DEGREE << endl;
+
+    prefetch_issued = 0;
+    prefetch_useful = 0;
+}
 
 
 void CACHE::l1d_prefetcher_initialize() 
 {
-    std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+    cout << "CPU " << cpu << " L1D Uniform-Stride prefetcher" << endl;
+    for (int i = 0; i < IP_TRACKER_COUNT; i++)
+        trackers[i].lru = i;
+    PREFETCH_DEGREE = DEGREE_INIT;
+    UNIFORM_THRESHOLD = UNIFORM_THRESHOLD_INIT;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+   // Cache Line Index
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    // Strip the IP down to a smaller size to reduce the number of trackers we need to maintain
+    ip = ip & MASK_IP;
+
+    int index = -1;
+
+    // Check if that IP is in our tracker table
+    for (index = 0; index < IP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip)
+            break;
+    }
+
+    // this is a new IP that doesn't have a tracker yet, so allocate one
+    if (index == IP_TRACKER_COUNT) {
+
+        // find the least recently used tracker to evict
+        for (index = 0; index < IP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (IP_TRACKER_COUNT - 1))
+                break;
+        }
+
+        trackers[index].ip = ip;
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = 0;
+        trackers[index].uniform_stride = -1;
+        trackers[index].uniform_confidence = 0;
+        trackers[index].state = 0;
+
+        // cout << "[IP_STRIDE] MISS index: " << index << " lru: " << trackers[index].lru << " ip: " << hex << ip << " cl_addr: " << cl_addr << dec << endl;
+        for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+
+        // Mark this tracker as the most recently used
+        trackers[index].lru = 0;
+        // dynamically choose the degree
+        update_prefetch_degree();
+
+        return; // metadata_in;
+    }
+
+    // sanity check
+    // at this point we should know a matching tracker index
+    if (index == -1)
+        assert(0);
+    
+    // calculate the stride between the current address and the last address
+    // this bit appears overly complicated because we're calculating
+    // differences between unsigned address variables
+    int64_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }
+    // don't do anything if we somehow saw the same address twice in a row
+    if (stride == 0)
+        return; // metadata_in;
+
+    // only do any prefetching if there's a pattern of seeing the same
+    // stride more than once
+    if (stride == trackers[index].last_stride) {
+
+
+        // incrementing the confidence of the tracker
+        if(trackers[index].uniform_confidence<(UNIFORM_THRESHOLD)){
+            trackers[index].uniform_confidence++;
+        }
+
+        // don't prefetch until confidence is 3
+        if(trackers[index].uniform_confidence>=UNIFORM_THRESHOLD) {
+            trackers[index].state=1;
+            trackers[index].uniform_stride=stride;
+        }
+        if(trackers[index].state==1){
+            // do some prefetching
+            for (int i = 0; i < PREFETCH_DEGREE; i++) {
+                
+
+                uint64_t pf_address = (cl_addr + (trackers[index].uniform_stride * (i + 1))) << LOG2_BLOCK_SIZE;
+
+                // only issue a prefetch if the prefetch address is in the same 4 KB page
+                // as the current demand access address
+                if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    break;
+
+                prefetch_issued++;
+
+                // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
+                if (MSHR.occupancy < (MSHR.SIZE >> 1))
+                    prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+                else
+                    prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+                
+            }
+        }
+    }
+    else{
+        if(trackers[index].uniform_confidence>0){
+                trackers[index].uniform_confidence--;
+                if(trackers[index].uniform_confidence<UNIFORM_THRESHOLD) trackers[index].state=0;
+            }
+    }
+
+    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_stride = stride;
+
+    for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+
+    // Mark this tracker as the most recently used
+    trackers[index].lru = 0;
+    return; // metadata_in;
+
+
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
@@ -20,5 +234,8 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t s
 
 void CACHE::l1d_prefetcher_final_stats()
 {
+    cout << "CPU " << cpu << " SPP final stats" << endl;
+    cout << "Prefetch issued by SPP: " << prefetch_issued << endl;
+    cout << "Degree: " << PREFETCH_DEGREE << endl;
 
 }
