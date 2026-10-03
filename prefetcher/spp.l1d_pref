@@ -1,24 +1,223 @@
 #include "cache.h"
+#include <cstring>
+#include <type_traits>
+#include <vector>
 
+#define IP_TRACKER_COUNT 24
+#define PREFETCH_DEGREE 3
+#define MASK_IP 0xFF
+#define PAST_STRIDES 7
 
-void CACHE::l1d_prefetcher_initialize() 
-{
-    std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+class LRU_Element {
+public:
+    int8_t lru;
+    uint64_t unique_id;
+
+    LRU_Element(uint64_t unique_id) : 
+        unique_id(unique_id), 
+        lru(0) {}
+    
+    // Virtual destructor added to ensure proper cleanup of derived classes
+    virtual ~LRU_Element() = default; 
+};
+
+template <typename T>
+class LRU_Block {
+private:
+    int size;
+    std::vector<T*> elements;
+
+public:
+    LRU_Block(int s): size(s) {
+        // Initializes with nullptrs
+        elements = std::vector<T*>(size, nullptr);
+    }
+    
+    // CHANGED: Added a destructor to clean up dynamically allocated elements 
+    // when a tracker is evicted or destroyed.
+    ~LRU_Block() {
+        for (auto elem : elements) {
+            if (elem) delete elem;
+        }
+    }
+    
+    // CHANGED: Added getter to safely iterate over elements during prefetch generation
+    const std::vector<T*>& get_elements() const {
+        return elements;
+    }
+
+    // First Element: Pointer to the element with the unique_id
+    // Second Element: True if the element was newly inserted, False if it already existed
+    std::pair<T*, bool> insert(uint64_t unique_id) {
+        int index = 0;
+
+        // 1. Search for existing element
+        for (index = 0; index < size; index++) {
+            if (elements[index] && elements[index]->unique_id == unique_id) {
+                break; // Found it!
+            }
+        }
+
+        // 2. Element not found, we need to insert and potentially evict
+        if (index == size) {
+            int victim_idx = -1;
+            
+            // CHANGED: Safely find an empty slot OR the LRU victim
+            for (int i = 0; i < size; i++) {
+                if (!elements[i]) {
+                    victim_idx = i; // Found an empty slot!
+                    break;
+                }
+                if (elements[i]->lru == (size - 1)) {
+                    victim_idx = i; // Found the LRU victim
+                }
+            }
+
+            // Free the memory of the evicted element if the slot wasn't empty
+            if (elements[victim_idx]) {
+                delete elements[victim_idx]; 
+            }
+            
+            elements[victim_idx] = new T(unique_id);
+            index = victim_idx; // Set index to our newly inserted element
+            
+            // Update LRUs: Since we inserted a new Most Recently Used (MRU = 0), 
+            // all other existing elements age by 1.
+            for (int i = 0; i < size; i++) {
+                if (elements[i] && i != index && elements[i]->lru < size - 1) {
+                    elements[i]->lru++;
+                }
+            }
+
+            elements[index]->lru = 0;
+            return std::make_pair(elements[index], true);
+        }
+
+        // 3. Element was found! We just need to update LRU states.
+        // CHANGED: Only age elements that are currently more recently used than the accessed element.
+        int current_lru = elements[index]->lru;
+        for (int i = 0; i < size; i++) {
+            if (elements[i] && elements[i]->lru < current_lru) {
+                elements[i]->lru++;
+            }
+        }
+
+        elements[index]->lru = 0; // Accessed element becomes MRU
+        return std::make_pair(elements[index], false);
+    }
+};
+
+class Stride_Element: public LRU_Element {
+public: 
+    // CHANGED: Removed the `uint64_t& stride` reference. References inside objects 
+    // prevent implicit assignment operators. Instead, we use a helper function to 
+    // cast the unsigned unique_id back to a signed integer.
+    LRU_Block<Stride_Element> next_strides;
+
+    Stride_Element(uint64_t id) : 
+        LRU_Element(id), 
+        next_strides(PREFETCH_DEGREE) {}
+        
+    int64_t get_stride_val() const {
+        return static_cast<int64_t>(unique_id);
+    }
+};
+
+class Tracker_Element: public LRU_Element {
+public:
+    uint64_t last_cl_addr;
+    Stride_Element* last_stride;
+    LRU_Block<Stride_Element> strides;
+
+    Tracker_Element(uint64_t id) : 
+        LRU_Element(id), 
+        last_cl_addr(0),
+        last_stride(nullptr),
+        strides(PAST_STRIDES) {}
+};
+
+// Global Table
+LRU_Block<Tracker_Element> trackers(IP_TRACKER_COUNT);
+
+void CACHE::l1d_prefetcher_initialize() {
+    cout << "CPU " << cpu << " L1D Stride Pattern Prefetcher" << endl;
 }
 
-void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
-{
-   
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag) {
+    // Cache Line Index
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    // Strip the IP down to a smaller size to reduce the number of trackers we need to maintain
+    ip = ip & MASK_IP;
+
+    auto tracker_result = trackers.insert(ip);
+    Tracker_Element* tracker = tracker_result.first;
+    bool is_new_tracker = tracker_result.second;
+
+    if (is_new_tracker) {
+        tracker->last_cl_addr = cl_addr;
+        tracker->last_stride = nullptr;
+        return;
+    }
+
+    // CHANGED: Simplified signed arithmetic for stride calculation. 
+    // Just cast cl_addr to signed, subtract, and unique_id will handle the binary representation.
+    int64_t stride = static_cast<int64_t>(cl_addr) - static_cast<int64_t>(tracker->last_cl_addr);
+
+    // No spatial movement, nothing to prefetch or learn.
+    if (stride == 0) {
+        return;
+    }
+
+    // Notice we implicitly cast int64_t stride to uint64_t unique_id here. 
+    // This is safe because we cast it back in get_stride_val().
+    auto stride_result = tracker->strides.insert(stride);
+    Stride_Element* stride_element = stride_result.first;
+
+    // CHANGED: We MUST link the previous stride to this stride even if this stride 
+    // isn't new. The transition (last_stride -> current stride) is what we are learning!
+    if(tracker->last_stride != nullptr) {
+        tracker->last_stride->next_strides.insert(stride);
+    }
+
+    // Update the tracker for the NEXT access
+    tracker->last_cl_addr = cl_addr;
+    tracker->last_stride = stride_element;
+
+    // --- PREFETCH GENERATION ---
+    // Look into the next_strides LRU block of our CURRENT stride to see what usually comes next
+    for (auto next_expected_stride : stride_element->next_strides.get_elements()) {
+        
+        // Ensure the pointer isn't null (slot is actually populated)
+        if (next_expected_stride) {
+            
+            // Get the signed stride value
+            int64_t next_stride_val = next_expected_stride->get_stride_val();
+            
+            // Prefetch Address
+            uint64_t pf_address = (cl_addr + next_stride_val) << LOG2_BLOCK_SIZE;
+            
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) {
+                continue; // Skip prefetches that cross page boundaries
+            }
+
+            if (MSHR.occupancy < (MSHR.SIZE >> 1)) {
+                prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            }
+            else {
+                prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+            }
+        }
+    }
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	return; //metadata_in;
+    return;
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+    // Clean up trackers (triggers cascade of destructors resolving memory leaks)
+    // Optional depending on if you want to cleanly exit ChampSim memory
 }
