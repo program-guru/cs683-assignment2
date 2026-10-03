@@ -1,7 +1,8 @@
 #include "cache.h"
+#include <algorithm>
 #include <cstring>
-#include <type_traits>
 #include <vector>
+#include <functional>
 
 #define IP_TRACKER_COUNT 24
 #define PREFETCH_DEGREE 3
@@ -13,42 +14,42 @@ public:
     int8_t lru;
     uint64_t unique_id;
 
-    LRU_Element(uint64_t unique_id) : 
-        unique_id(unique_id), 
-        lru(0) {}
-    
+    LRU_Element(uint64_t unique_id) : unique_id(unique_id),
+                                      lru(0) {}
+
     // Virtual destructor added to ensure proper cleanup of derived classes
-    virtual ~LRU_Element() = default; 
+    virtual ~LRU_Element() = default;
 };
 
 template <typename T>
 class LRU_Block {
 private:
     int size;
-    std::vector<T*> elements;
+    std::vector<T *> elements;
 
 public:
-    LRU_Block(int s): size(s) {
+    LRU_Block(int s) : size(s) {
         // Initializes with nullptrs
-        elements = std::vector<T*>(size, nullptr);
+        elements = std::vector<T *>(size, nullptr);
     }
-    
-    // CHANGED: Added a destructor to clean up dynamically allocated elements 
+
+    // CHANGED: Added a destructor to clean up dynamically allocated elements
     // when a tracker is evicted or destroyed.
     ~LRU_Block() {
         for (auto elem : elements) {
-            if (elem) delete elem;
+            if (elem)
+                delete elem;
         }
     }
-    
+
     // CHANGED: Added getter to safely iterate over elements during prefetch generation
-    const std::vector<T*>& get_elements() const {
+    const std::vector<T *> &get_elements() const {
         return elements;
     }
 
     // First Element: Pointer to the element with the unique_id
     // Second Element: True if the element was newly inserted, False if it already existed
-    std::pair<T*, bool> insert(uint64_t unique_id) {
+    std::pair<T *, bool> insert(uint64_t unique_id) {
         int index = 0;
 
         // 1. Search for existing element
@@ -61,7 +62,7 @@ public:
         // 2. Element not found, we need to insert and potentially evict
         if (index == size) {
             int victim_idx = -1;
-            
+
             // CHANGED: Safely find an empty slot OR the LRU victim
             for (int i = 0; i < size; i++) {
                 if (!elements[i]) {
@@ -75,13 +76,13 @@ public:
 
             // Free the memory of the evicted element if the slot wasn't empty
             if (elements[victim_idx]) {
-                delete elements[victim_idx]; 
+                delete elements[victim_idx];
             }
-            
+
             elements[victim_idx] = new T(unique_id);
             index = victim_idx; // Set index to our newly inserted element
-            
-            // Update LRUs: Since we inserted a new Most Recently Used (MRU = 0), 
+
+            // Update LRUs: Since we inserted a new Most Recently Used (MRU = 0),
             // all other existing elements age by 1.
             for (int i = 0; i < size; i++) {
                 if (elements[i] && i != index && elements[i]->lru < size - 1) {
@@ -107,33 +108,31 @@ public:
     }
 };
 
-class Stride_Element: public LRU_Element {
-public: 
-    // CHANGED: Removed the `uint64_t& stride` reference. References inside objects 
-    // prevent implicit assignment operators. Instead, we use a helper function to 
+class Stride_Element : public LRU_Element {
+public:
+    // CHANGED: Removed the `uint64_t& stride` reference. References inside objects
+    // prevent implicit assignment operators. Instead, we use a helper function to
     // cast the unsigned unique_id back to a signed integer.
     LRU_Block<Stride_Element> next_strides;
 
-    Stride_Element(uint64_t id) : 
-        LRU_Element(id), 
-        next_strides(PREFETCH_DEGREE) {}
-        
+    Stride_Element(uint64_t id) : LRU_Element(id),
+                                  next_strides(PREFETCH_DEGREE) {}
+
     int64_t get_stride_val() const {
         return static_cast<int64_t>(unique_id);
     }
 };
 
-class Tracker_Element: public LRU_Element {
+class Tracker_Element : public LRU_Element {
 public:
     uint64_t last_cl_addr;
-    Stride_Element* last_stride;
+    Stride_Element *last_stride;
     LRU_Block<Stride_Element> strides;
 
-    Tracker_Element(uint64_t id) : 
-        LRU_Element(id), 
-        last_cl_addr(0),
-        last_stride(nullptr),
-        strides(PAST_STRIDES) {}
+    Tracker_Element(uint64_t id) : LRU_Element(id),
+                                   last_cl_addr(0),
+                                   last_stride(nullptr),
+                                   strides(PAST_STRIDES) {}
 };
 
 // Global Table
@@ -160,8 +159,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         return;
     }
 
-    // CHANGED: Simplified signed arithmetic for stride calculation. 
-    // Just cast cl_addr to signed, subtract, and unique_id will handle the binary representation.
+    // Calculate stride
     int64_t stride = static_cast<int64_t>(cl_addr) - static_cast<int64_t>(tracker->last_cl_addr);
 
     // No spatial movement, nothing to prefetch or learn.
@@ -169,13 +167,10 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         return;
     }
 
-    // Notice we implicitly cast int64_t stride to uint64_t unique_id here. 
-    // This is safe because we cast it back in get_stride_val().
     auto stride_result = tracker->strides.insert(stride);
     Stride_Element* stride_element = stride_result.first;
 
-    // CHANGED: We MUST link the previous stride to this stride even if this stride 
-    // isn't new. The transition (last_stride -> current stride) is what we are learning!
+    // Link the previous stride to this stride (Learning phase)
     if(tracker->last_stride != nullptr) {
         tracker->last_stride->next_strides.insert(stride);
     }
@@ -184,40 +179,85 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     tracker->last_cl_addr = cl_addr;
     tracker->last_stride = stride_element;
 
-    // --- PREFETCH GENERATION ---
-    // Look into the next_strides LRU block of our CURRENT stride to see what usually comes next
-    for (auto next_expected_stride : stride_element->next_strides.get_elements()) {
-        
-        // Ensure the pointer isn't null (slot is actually populated)
-        if (next_expected_stride) {
-            
-            // Get the signed stride value
-            int64_t next_stride_val = next_expected_stride->get_stride_val();
-            
-            // Prefetch Address
-            uint64_t pf_address = (cl_addr + next_stride_val) << LOG2_BLOCK_SIZE;
-            
-            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) {
-                continue; // Skip prefetches that cross page boundaries
-            }
+    // --- PREFETCH GENERATION (DFS Lookahead Mechanism) ---
+    
+    int prefetches_issued = 0;
+    std::function<void(Stride_Element*, uint64_t)> dfs_lookahead;
 
-            if (MSHR.occupancy < (MSHR.SIZE >> 1)) {
-                prefetch_line(ip, addr, pf_address, FILL_L1, 0);
-            }
-            else {
-                prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+    // Recursive lambda for DFS traversal
+    dfs_lookahead = [&](Stride_Element* current_state, uint64_t current_spec_cl) -> void {
+        // Base case: Stop if we've reached our prefetch budget
+        if (prefetches_issued >= PREFETCH_DEGREE) {
+            return;
+        }
+
+        // 1. Gather all valid outgoing edges (next strides)
+        std::vector<Stride_Element*> next_edges;
+        for (auto ns : current_state->next_strides.get_elements()) {
+            if (ns) {
+                next_edges.push_back(ns);
             }
         }
-    }
+
+        // 2. Sort edges by LRU (ascending). 
+        // This ensures we always try the most confident (lowest LRU) path first.
+        std::sort(next_edges.begin(), next_edges.end(), [](Stride_Element* a, Stride_Element* b) {
+            return a->lru < b->lru;
+        });
+
+        // 3. Traverse the sorted edges
+        for (auto edge : next_edges) {
+            if (prefetches_issued >= PREFETCH_DEGREE) {
+                break; 
+            }
+
+            int64_t next_stride_val = edge->get_stride_val();
+            uint64_t next_spec_cl = current_spec_cl + next_stride_val;
+            uint64_t pf_addr = next_spec_cl << LOG2_BLOCK_SIZE;
+
+            // Check Page Boundary
+            if ((pf_addr >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) {
+                // Instead of aborting the whole lookahead, we backtrack and try 
+                // the next best stride in our sorted list.
+                continue; 
+            }
+
+            // Issue the prefetch
+            if (MSHR.occupancy < (MSHR.SIZE >> 1)) {
+                prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
+            } else {
+                prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
+            }
+            
+            prefetches_issued++;
+
+            // 4. Find the state corresponding to this stride to continue DFS
+            Stride_Element* next_state = nullptr;
+            for (auto s : tracker->strides.get_elements()) {
+                if (s && s->get_stride_val() == next_stride_val) {
+                    next_state = s;
+                    break;
+                }
+            }
+
+            // 5. Recurse deeper into the graph. 
+            // If next_state is null, the recursion won't happen, the loop continues, 
+            // and we naturally BACKTRACK to the next edge in `next_edges`.
+            if (next_state) {
+                dfs_lookahead(next_state, next_spec_cl);
+            }
+        }
+    };
+
+    // Kick off the DFS from the current stride state
+    dfs_lookahead(stride_element, cl_addr);
 }
 
-void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
-{
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in) {
     return;
 }
 
-void CACHE::l1d_prefetcher_final_stats()
-{
+void CACHE::l1d_prefetcher_final_stats() {
     // Clean up trackers (triggers cascade of destructors resolving memory leaks)
     // Optional depending on if you want to cleanly exit ChampSim memory
 }
