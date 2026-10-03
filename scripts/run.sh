@@ -30,8 +30,8 @@ for pref in "${L1D_PREFETCHERS[@]}"; do
             
             # Launch all runs in the background
             "${BIN_DIR}/${bin_name}" \
-                -warmup_instructions 250000 \
-                -simulation_instructions 250000 \
+                -warmup_instructions 25000000 \
+                -simulation_instructions 25000000 \
                 -traces "${trace_file}" > "${result_file}" 2>&1 &
         done
     done
