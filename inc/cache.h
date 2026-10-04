@@ -345,6 +345,7 @@ public:
         lru_update(uint32_t set, uint32_t way),
         fill_cache(uint32_t set, uint32_t way, PACKET *packet),
         update_prefetch_degree(),
+        issue_nonuniform_prefetch(uint64_t addr,uint64_t cl_addr,uint64_t ip,int index),
 
         (CACHE::*replacement_final_stats)(),
 

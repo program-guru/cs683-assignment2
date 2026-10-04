@@ -1,30 +1,40 @@
 #include "cache.h"
 #include<iostream>
 
+#define STATE_UNKNOWN    0
+#define STATE_UNIFORM    1
+#define STATE_NONUNIFORM 2
 
-#define DEGREE_MIN       1
-#define DEGREE_MAX       6
-#define DEGREE_INIT      3
+
+#define DEGREE_MIN 2
+#define DEGREE_INIT 3
+#define DEGREE_MAX 8// 4
 
 #define UNIFORM_THRESHOLD_INIT   3
-#define THRESHOLD_MIN 2
-#define THRESHOLD_MAX 5
+#define THRESHOLD_MIN 3
+#define THRESHOLD_MAX 5// 4
 
+#define ACC_HIGH         0.8         // % -> increase degree
+#define ACC_LOW          0.4         // % -> decrease degree
 
-
-#define ACC_HIGH         70         // % -> increase degree
-#define ACC_LOW          40         // % -> decrease degree
-
-#define ACC_WINDOW       500
+#define ACC_WINDOW       1000
 
 #define IP_TRACKER_COUNT 32
-#define MASK_IP 0xFF
+#define MASK_IP 0xFFF
+
+// Data for NON-UNIFORM stride patterns
+#define SIG_LEN 4  // length of the signature 
+#define NONUNIFORM_THRESHOLD 2
+#define SIG_TABLE_SIZE 256
 
 
 int PREFETCH_DEGREE;
 int UNIFORM_THRESHOLD;
-uint64_t prefetch_issued = 0;
-uint64_t prefetch_useful = 0;
+
+// using cache values instead of local values
+uint64_t last_pf_useful = 0;
+uint64_t last_pf_lower_level = 0;
+uint64_t last_pf_late = 0;
 
 class IP_TRACKER {
 public:
@@ -43,54 +53,266 @@ public:
     // the confidence rate of uniform prefetcher for this IP
     int uniform_confidence;
 
+    // If non-uniform then the signature of the current IP
+    uint64_t signature;
+
+    // to count the no. of past occurences stored in the signature
+    int signature_count;
+
+    // the confidence rate of non-uniform prefetcher for this IP
+    int nonuniform_confidence;
+
     //is it in uniform or non-uniform state 0 => Unknown, 1 => Uniform, 2 => Non-Uniform
     int state;
 
     // use LRU to evict old IP trackers
     uint32_t lru;
 
+
     IP_TRACKER() {
         ip = 0;
         last_cl_addr = 0;
         last_stride = 0;
-        lru = 0;
         uniform_confidence=0;
-        state=0;
-        uniform_stride=-1;
+        uniform_stride=0;
+        signature = 0;
+        nonuniform_confidence = 0;
+        state=STATE_UNKNOWN;
+        lru = 0;
+        signature_count = 0;
     };
+};
+
+class SIG_ENTRY {
+public:
+    uint64_t signature; // stores the signature
+    int64_t next_stride; //the next possible stride
+    int confidence; // the confidence rate of non-uniform prefetcher for this signature
+    uint32_t lru; // use LRU to evict old IP trackers
+
+    SIG_ENTRY() {
+        signature = 0;
+        next_stride = 0;
+        confidence = 0;
+        lru = 0;
+    }
 };
 
 IP_TRACKER trackers[IP_TRACKER_COUNT];
 
+SIG_ENTRY sig_table[SIG_TABLE_SIZE];
+
+// A helper function to find a signature
+int find_signature(uint64_t signature)
+{
+    for (int i = 0; i < SIG_TABLE_SIZE; i++) {
+        if (sig_table[i].confidence > 0 &&
+            sig_table[i].signature == signature)
+            return i;
+    }
+    return -1;
+}
+
+// A helper function to allocate a signature
+int allocate_signature(uint64_t signature)
+{
+    int victim = 0;
+    for (int i = 0; i < SIG_TABLE_SIZE; i++) {
+        if (sig_table[i].confidence == 0)
+            return i;
+        if (sig_table[i].lru > sig_table[victim].lru)
+            victim = i;
+    }
+
+    return victim;
+}
+
+// converting large strides into a value between 0 and 63 (can be represented by 6 bits)
+uint64_t encode_stride(int64_t stride)
+{
+    int64_t clipped = stride;
+
+    if (clipped > 31)
+        clipped = 31;
+
+    if (clipped < -32)
+        clipped = -32;
+
+    //makes sure that the value is positive
+    return (uint64_t)(clipped + 32);
+}
+
+// shifts the signature and adds the new stride to it
+uint64_t update_signature(uint64_t old_signature, int64_t stride)
+{
+    uint64_t encoded = encode_stride(stride);
+    // shifts the signature by 6 bits(one stride)
+    old_signature <<= 6;
+    // does & operation with 11111111 11111111 11111111 (to remove the oldest stride)
+    old_signature &= ((1ULL << (SIG_LEN * 6)) - 1);
+    // adds the new stride to the least significant position
+    old_signature |= encoded;
+
+    return old_signature;
+}
+
+void update_signature_lru(int index)
+{
+    for (int i = 0; i < SIG_TABLE_SIZE; i++) {
+        if (i != index &&
+            sig_table[i].confidence > 0 &&
+            sig_table[i].lru < sig_table[index].lru)
+        {
+            sig_table[i].lru++;
+        }
+    }
+
+    sig_table[index].lru = 0;
+}
+
+void update_nonuniform_table(uint64_t signature, int64_t next_stride)
+{
+    int index = find_signature(signature);
+
+    if (index == -1) {
+        index = allocate_signature(signature);
+
+        sig_table[index].signature = signature;
+        sig_table[index].next_stride = next_stride;
+        sig_table[index].confidence = 1;
+        update_signature_lru(index);
+
+        // cout << "NEW SIG: "
+        //  << hex << signature << dec
+        //  << " -> " << next_stride
+        //  << " conf=1"
+        //  << endl;
+
+        return;
+    }
+
+    if (sig_table[index].next_stride == next_stride) {
+        if (sig_table[index].confidence < NONUNIFORM_THRESHOLD)
+            sig_table[index].confidence++;
+        //     cout << "SIG MATCH: "
+        //  << hex << signature << dec
+        //  << " -> " << next_stride
+        //  << " conf=" << sig_table[index].confidence
+        //  << endl;
+    }
+    else {
+        if (sig_table[index].confidence > 0)
+            sig_table[index].confidence--;
+        if (sig_table[index].confidence == 0) {
+            sig_table[index].next_stride = next_stride;
+            sig_table[index].confidence = 1;
+        }
+    }
+    update_signature_lru(index);
+}
+
+int predict_nonuniform_stride(uint64_t signature)
+{
+    int index = find_signature(signature);
+
+    if (index == -1)
+        return 0;
+
+    if (sig_table[index].confidence < NONUNIFORM_THRESHOLD)
+        return 0;
+
+    return sig_table[index].next_stride;
+}
+
+
+void CACHE::issue_nonuniform_prefetch(uint64_t addr,uint64_t cl_addr,uint64_t ip,int index)
+{
+    //cout<<"Issuing NON-UNIFORM Prefetch"<<endl;
+    uint64_t temp_signature=trackers[index].signature;
+    for(int i=0; i<PREFETCH_DEGREE;i++){
+
+        int64_t predicted_stride = predict_nonuniform_stride(temp_signature);
+        
+        if (predicted_stride == 0)
+        return;
+
+        //cout<<"Non-Unifrom Prefetching for "<< predicted_stride<<endl;
+        
+        int64_t predicted_cl_addr = (int64_t)cl_addr + predicted_stride;
+        
+        if (predicted_cl_addr < 0)
+        return;
+        
+        uint64_t pf_address = ((uint64_t)predicted_cl_addr) << LOG2_BLOCK_SIZE;
+        
+        if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+        return;
+        
+        
+        if (MSHR.occupancy < (MSHR.SIZE >> 1))
+        prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+        else
+        prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+        uint64_t encoded = encode_stride(predicted_stride);
+        temp_signature <<= 6;
+        temp_signature &= ((1ULL << (SIG_LEN * 6)) - 1);
+        temp_signature |= encoded;
+        cl_addr= (int64_t)cl_addr+predicted_stride;
+
+    }
+}
+
 
 void CACHE::update_prefetch_degree()
 {
-    if (prefetch_issued < ACC_WINDOW)
+    // Detect warmup -> ROI counter reset
+    if (pf_useful < last_pf_useful ||
+        pf_late < last_pf_late ||
+        pf_lower_level < last_pf_lower_level)
+    {
+        last_pf_useful      = pf_useful;
+        last_pf_late        = pf_late;
+        last_pf_lower_level = pf_lower_level;
+        return;
+    }
+
+    uint64_t current_lower_level = pf_lower_level - last_pf_lower_level;
+    if (current_lower_level < ACC_WINDOW)
         return;
 
-    double accuracy =
-        (100.0 * prefetch_useful) / prefetch_issued;
+    uint64_t current_useful = pf_useful - last_pf_useful;
+    uint64_t current_late   = pf_late   - last_pf_late;
 
-    if (accuracy > ACC_HIGH) {
-        if (PREFETCH_DEGREE < DEGREE_MAX)
-            PREFETCH_DEGREE++;
-        if (UNIFORM_THRESHOLD > THRESHOLD_MIN)
-            UNIFORM_THRESHOLD--;
+    // a late prefetch still fetched the right line, so count it as used
+    double accuracy = (double)(current_useful + current_late) / current_lower_level;
+
+    if (accuracy < ACC_LOW) {
+        // inaccurate: back off
+        if (PREFETCH_DEGREE > DEGREE_MIN)       PREFETCH_DEGREE--;
+        if (UNIFORM_THRESHOLD < THRESHOLD_MAX)  UNIFORM_THRESHOLD++;
     }
-    else if (accuracy < ACC_LOW) {
-        if (PREFETCH_DEGREE > DEGREE_MIN)
-            PREFETCH_DEGREE--;
-        if (UNIFORM_THRESHOLD < THRESHOLD_MAX)
-            UNIFORM_THRESHOLD++;
+    else {
+        // accurate enough: go further ahead if prefetches are arriving late
+        if (accuracy > ACC_HIGH || current_late > current_useful) {
+            if (PREFETCH_DEGREE < DEGREE_MAX)   PREFETCH_DEGREE++;
+        }
+        if (accuracy > ACC_HIGH) {
+            if (UNIFORM_THRESHOLD > THRESHOLD_MIN) UNIFORM_THRESHOLD--;
+        }
     }
 
-    cout << "SPP Accuracy: " << accuracy
-         << "% Degree: " << PREFETCH_DEGREE << endl;
+    cout << "L1D Prefetch Accuracy: " << accuracy * 100.0
+         << "% Degree: " << PREFETCH_DEGREE
+         << " Useful: " << current_useful
+         << " Late: " << current_late
+         << " LowerLevel: " << current_lower_level
+         << endl;
 
-    prefetch_issued = 0;
-    prefetch_useful = 0;
+    last_pf_useful      = pf_useful;
+    last_pf_late        = pf_late;
+    last_pf_lower_level = pf_lower_level;
 }
-
 
 void CACHE::l1d_prefetcher_initialize() 
 {
@@ -99,12 +321,15 @@ void CACHE::l1d_prefetcher_initialize()
         trackers[i].lru = i;
     PREFETCH_DEGREE = DEGREE_INIT;
     UNIFORM_THRESHOLD = UNIFORM_THRESHOLD_INIT;
+    for (int i = 0; i < SIG_TABLE_SIZE; i++) sig_table[i].lru = i;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
    // Cache Line Index
     uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    uint64_t original_ip = ip;
 
     // Strip the IP down to a smaller size to reduce the number of trackers we need to maintain
     ip = ip & MASK_IP;
@@ -129,9 +354,13 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         trackers[index].ip = ip;
         trackers[index].last_cl_addr = cl_addr;
         trackers[index].last_stride = 0;
-        trackers[index].uniform_stride = -1;
+        trackers[index].uniform_stride = 0;
         trackers[index].uniform_confidence = 0;
-        trackers[index].state = 0;
+        trackers[index].state = STATE_UNKNOWN;
+        trackers[index].signature = 0;
+        trackers[index].nonuniform_confidence = 0;
+        trackers[index].signature_count = 0;
+
 
         // cout << "[IP_STRIDE] MISS index: " << index << " lru: " << trackers[index].lru << " ip: " << hex << ip << " cl_addr: " << cl_addr << dec << endl;
         for (int i = 0; i < IP_TRACKER_COUNT; i++) {
@@ -141,8 +370,6 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
         // Mark this tracker as the most recently used
         trackers[index].lru = 0;
-        // dynamically choose the degree
-        update_prefetch_degree();
 
         return; // metadata_in;
     }
@@ -166,52 +393,69 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     if (stride == 0)
         return; // metadata_in;
 
-    // only do any prefetching if there's a pattern of seeing the same
-    // stride more than once
-    if (stride == trackers[index].last_stride) {
-
-
-        // incrementing the confidence of the tracker
-        if(trackers[index].uniform_confidence<(UNIFORM_THRESHOLD)){
-            trackers[index].uniform_confidence++;
-        }
-
-        // don't prefetch until confidence is 3
-        if(trackers[index].uniform_confidence>=UNIFORM_THRESHOLD) {
-            trackers[index].state=1;
-            trackers[index].uniform_stride=stride;
-        }
-        if(trackers[index].state==1){
-            // do some prefetching
-            for (int i = 0; i < PREFETCH_DEGREE; i++) {
-                
-
-                uint64_t pf_address = (cl_addr + (trackers[index].uniform_stride * (i + 1))) << LOG2_BLOCK_SIZE;
-
-                // only issue a prefetch if the prefetch address is in the same 4 KB page
-                // as the current demand access address
-                if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
-                    break;
-
-                prefetch_issued++;
-
-                // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
-                if (MSHR.occupancy < (MSHR.SIZE >> 1))
-                    prefetch_line(ip, addr, pf_address, FILL_L1, 0);
-                else
-                    prefetch_line(ip, addr, pf_address, FILL_L2, 0);
-
-                
-            }
-        }
+    // training the nonuniform table and the setting the confidence values
+    int predicted_index = find_signature(trackers[index].signature);
+    if (predicted_index != -1 && sig_table[predicted_index].next_stride == stride){
+    if (trackers[index].nonuniform_confidence < NONUNIFORM_THRESHOLD)
+        trackers[index].nonuniform_confidence++;
     }
-    else{
-        if(trackers[index].uniform_confidence>0){
-                trackers[index].uniform_confidence--;
-                if(trackers[index].uniform_confidence<UNIFORM_THRESHOLD) trackers[index].state=0;
-            }
+    else {
+        if (trackers[index].nonuniform_confidence > 0)
+            trackers[index].nonuniform_confidence--;
     }
 
+    uint64_t old_sig = trackers[index].signature;
+
+    trackers[index].signature = update_signature(trackers[index].signature, stride);
+
+
+    // incrementing the confidence of the tracker
+    
+    if (stride == trackers[index].last_stride) { 
+        if (trackers[index].uniform_confidence < THRESHOLD_MAX) trackers[index].uniform_confidence++; trackers[index].uniform_stride = stride; 
+    }
+    else if (trackers[index].uniform_confidence > 0) trackers[index].uniform_confidence--;
+    if (trackers[index].uniform_confidence >= UNIFORM_THRESHOLD && trackers[index].uniform_stride != 0) trackers[index].state = STATE_UNIFORM;
+    else if (trackers[index].nonuniform_confidence >= NONUNIFORM_THRESHOLD) trackers[index].state = STATE_NONUNIFORM;
+    else   trackers[index].state = STATE_UNKNOWN;
+
+    
+    // Learn non-uniform pattern
+    if (trackers[index].signature_count >= SIG_LEN){
+        update_nonuniform_table(old_sig, stride);
+    }
+
+    if (trackers[index].signature_count < SIG_LEN)
+    trackers[index].signature_count++;
+
+    if(trackers[index].state==STATE_UNIFORM){
+        // do some prefetching
+        //cout<<"Issuing UNIFORM Prefetch"<<endl;
+        for (int i = 0; i < PREFETCH_DEGREE; i++) {
+            
+
+            uint64_t pf_address = (cl_addr + (trackers[index].uniform_stride * (i + 1))) << LOG2_BLOCK_SIZE;
+
+            // only issue a prefetch if the prefetch address is in the same 4 KB page
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
+            if (MSHR.occupancy < (MSHR.SIZE >> 1))
+                prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            else
+                prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+            
+        } 
+    }
+    else if (trackers[index].state == STATE_NONUNIFORM) {
+            issue_nonuniform_prefetch(addr,cl_addr,ip,index);
+    }  
+
+
+    // Add current stride to tracker
     trackers[index].last_cl_addr = cl_addr;
     trackers[index].last_stride = stride;
 
@@ -222,6 +466,15 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
     // Mark this tracker as the most recently used
     trackers[index].lru = 0;
+    // dynamically choose the degree
+    update_prefetch_degree();
+
+    // cout << "Original IP: " << hex << original_ip
+    //  << " Masked IP: " << ip
+    //  << " Tracker: " << index
+    //  << " cl_addr: " << dec << cl_addr
+    //  << endl;
+
     return; // metadata_in;
 
 
@@ -235,7 +488,6 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t s
 void CACHE::l1d_prefetcher_final_stats()
 {
     cout << "CPU " << cpu << " SPP final stats" << endl;
-    cout << "Prefetch issued by SPP: " << prefetch_issued << endl;
     cout << "Degree: " << PREFETCH_DEGREE << endl;
 
 }

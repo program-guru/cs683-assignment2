@@ -22,9 +22,6 @@ uint8_t L2C_BYPASS_KNOB = 0;    //Neelu: Set to 1: Bypass Instructions 2: Bypass
 #define NUM_OF_STRIDE_BITS 8 //13	//Neelu: IPCP stride
 
 
-//for dynamic uniform prefetching
-extern uint64_t prefetch_useful;
-
 //Neelu: For Ideal Spatial Prefetcher
 #define IDEAL_SPATIAL_REGIONS 64
 vector <uint64_t> regions_accessed, total_regions;                             //Neelu: regions accessed for ideal spatial prefetcher
@@ -1850,7 +1847,6 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                 // update prefetch stats and reset prefetch bit
                 if (block[set][way].prefetch) {
                     pf_useful++;
-                    prefetch_useful++;
                     block[set][way].prefetch = 0;
 
                     //Neelu: IPCP prefetch stats
