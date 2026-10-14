@@ -5,9 +5,16 @@
 #include <functional>
 
 #define IP_TRACKER_COUNT 24
-#define PREFETCH_DEGREE 3
 #define MASK_IP 0xFF
 #define PAST_STRIDES 7
+
+#define CONF_MAX          3    // saturating counter ceiling
+#define CONF_MIN          0    // saturating counter floor
+#define CONF_HIGH_THRESH  2    // confidence >= this -> aggressive
+#define CONF_LOW_THRESH   1    // confidence <= this -> minimal
+#define DEGREE_HIGH       4
+#define DEGREE_MED        3    
+#define DEGREE_LOW        1
 
 class LRU_Element {
 public:
@@ -115,8 +122,14 @@ public:
     // cast the unsigned unique_id back to a signed integer.
     LRU_Block<Stride_Element> next_strides;
 
+    // NEW: per-edge saturating confidence counter. Lives directly on the edge
+    // this stride represents, so "how trustworthy is this specific predicted
+    // transition" is tracked locally, with zero extra containers.
+    int8_t confidence;
+
     Stride_Element(uint64_t id) : LRU_Element(id),
-                                  next_strides(PREFETCH_DEGREE) {}
+                                  next_strides(3),
+                                  confidence(0) {}
 
     int64_t get_stride_val() const {
         return static_cast<int64_t>(unique_id);
@@ -129,17 +142,24 @@ public:
     Stride_Element *last_stride;
     LRU_Block<Stride_Element> strides;
 
+    // NEW: what we predicted would be the *next* stride, so we can check it
+    // against reality on the following access and adjust that edge's confidence.
+    int64_t predicted_stride;
+    bool has_prediction;
+
     Tracker_Element(uint64_t id) : LRU_Element(id),
                                    last_cl_addr(0),
                                    last_stride(nullptr),
-                                   strides(PAST_STRIDES) {}
+                                   strides(PAST_STRIDES),
+                                   predicted_stride(0),
+                                   has_prediction(false) {}
 };
 
 // Global Table
 LRU_Block<Tracker_Element> trackers(IP_TRACKER_COUNT);
 
 void CACHE::l1d_prefetcher_initialize() {
-    cout << "CPU " << cpu << " L1D Stride Pattern Prefetcher" << endl;
+    cout << "CPU " << cpu << " L1D Stride Pattern Prefetcher (per-edge confidence throttling)" << endl;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag) {
@@ -156,6 +176,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     if (is_new_tracker) {
         tracker->last_cl_addr = cl_addr;
         tracker->last_stride = nullptr;
+        tracker->has_prediction = false;
         return;
     }
 
@@ -165,6 +186,24 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     // No spatial movement, nothing to prefetch or learn.
     if (stride == 0) {
         return;
+    }
+
+    // Before touching last_stride for this access, check whether what we
+    // predicted last time actually happened, and adjust that edge's
+    // confidence accordingly.
+    if (tracker->has_prediction && tracker->last_stride != nullptr) {
+        bool correct = (stride == tracker->predicted_stride);
+
+        for (auto edge : tracker->last_stride->next_strides.get_elements()) {
+            if (edge && edge->get_stride_val() == tracker->predicted_stride) {
+                if (correct) {
+                    if (edge->confidence < CONF_MAX) edge->confidence++;
+                } else {
+                    if (edge->confidence > CONF_MIN) edge->confidence--;
+                }
+                break;
+            }
+        }
     }
 
     auto stride_result = tracker->strides.insert(stride);
@@ -180,14 +219,15 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     tracker->last_stride = stride_element;
 
     // --- PREFETCH GENERATION (DFS Lookahead Mechanism) ---
-    
-    int prefetches_issued = 0;
-    std::function<void(Stride_Element*, uint64_t)> dfs_lookahead;
 
-    // Recursive lambda for DFS traversal
-    dfs_lookahead = [&](Stride_Element* current_state, uint64_t current_spec_cl) -> void {
-        // Base case: Stop if we've reached our prefetch budget
-        if (prefetches_issued >= PREFETCH_DEGREE) {
+    int prefetches_issued = 0;
+    std::function<void(Stride_Element*, uint64_t, int)> dfs_lookahead;
+
+    // Recursive lambda for DFS traversal. `degree_budget` is the per-call
+    // throttled degree, derived from the confidence of the edge being followed.
+    dfs_lookahead = [&](Stride_Element* current_state, uint64_t current_spec_cl, int degree_budget) -> void {
+        // Base case: Stop if we've reached our (confidence-derived) prefetch budget
+        if (prefetches_issued >= degree_budget) {
             return;
         }
 
@@ -199,7 +239,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             }
         }
 
-        // 2. Sort edges by LRU (ascending). 
+        // 2. Sort edges by LRU (ascending).
         // This ensures we always try the most confident (lowest LRU) path first.
         std::sort(next_edges.begin(), next_edges.end(), [](Stride_Element* a, Stride_Element* b) {
             return a->lru < b->lru;
@@ -207,8 +247,19 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
         // 3. Traverse the sorted edges
         for (auto edge : next_edges) {
-            if (prefetches_issued >= PREFETCH_DEGREE) {
-                break; 
+            if (prefetches_issued >= degree_budget) {
+                break;
+            }
+
+            // NEW: let this specific edge's confidence set its own degree
+            // budget. A low-confidence edge gets throttled on the spot
+            // instead of relying on one global accuracy number.
+            int edge_degree = (edge->confidence >= CONF_HIGH_THRESH) ? DEGREE_HIGH
+                             : (edge->confidence <= CONF_LOW_THRESH)  ? DEGREE_LOW
+                                                                      : DEGREE_MED;
+            int effective_budget = std::min(degree_budget, edge_degree);
+            if (prefetches_issued >= effective_budget) {
+                continue; // this low-confidence edge is throttled away; try the next one
             }
 
             int64_t next_stride_val = edge->get_stride_val();
@@ -217,9 +268,9 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
             // Check Page Boundary
             if ((pf_addr >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) {
-                // Instead of aborting the whole lookahead, we backtrack and try 
+                // Instead of aborting the whole lookahead, we backtrack and try
                 // the next best stride in our sorted list.
-                continue; 
+                continue;
             }
 
             // Issue the prefetch
@@ -228,8 +279,15 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             } else {
                 prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
             }
-            
+
             prefetches_issued++;
+
+            // Remember this as the prediction to verify on the tracker's NEXT access
+            // (only the immediate next-level guess is checkable this way).
+            if (current_state == stride_element) {
+                tracker->predicted_stride = next_stride_val;
+                tracker->has_prediction = true;
+            }
 
             // 4. Find the state corresponding to this stride to continue DFS
             Stride_Element* next_state = nullptr;
@@ -240,17 +298,24 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
                 }
             }
 
-            // 5. Recurse deeper into the graph. 
-            // If next_state is null, the recursion won't happen, the loop continues, 
+            // 5. Recurse deeper into the graph.
+            // If next_state is null, the recursion won't happen, the loop continues,
             // and we naturally BACKTRACK to the next edge in `next_edges`.
             if (next_state) {
-                dfs_lookahead(next_state, next_spec_cl);
+                dfs_lookahead(next_state, next_spec_cl, effective_budget);
             }
         }
     };
 
-    // Kick off the DFS from the current stride state
-    dfs_lookahead(stride_element, cl_addr);
+    // If this access produced no outgoing edges to predict from, clear the
+    // pending prediction so a stale guess isn't checked next time.
+    if (stride_element->next_strides.get_elements().empty()) {
+        tracker->has_prediction = false;
+    }
+
+    // Kick off the DFS from the current stride state, starting from the
+    // original (unthrottled) ceiling; individual edges throttle themselves.
+    dfs_lookahead(stride_element, cl_addr, DEGREE_HIGH);
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in) {
@@ -258,6 +323,4 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t s
 }
 
 void CACHE::l1d_prefetcher_final_stats() {
-    // Clean up trackers (triggers cascade of destructors resolving memory leaks)
-    // Optional depending on if you want to cleanly exit ChampSim memory
 }
