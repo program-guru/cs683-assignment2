@@ -29,7 +29,8 @@ do
     output="assignment2-trace${i}-data.txt"
     : > "$output"     # start with a clean file each run
 
-    run_one ./bin/rrip_test "$trace" "TRACE ${i} - BASELINE(RRIP)" "$output"
+    run_one ./bin/baseline "$trace" "TRACE ${i} - BASELINE(LRU)" "$output"
+    run_one ./bin/rrip_test "$trace" "TRACE ${i} - RRIP" "$output"
     run_one ./bin/irrip_test "$trace" "TRACE ${i} - IRRIP" "$output"
     run_one ./bin/dyn_irrip_test    "$trace" "TRACE ${i} - DIRRIP"     "$output"
 done

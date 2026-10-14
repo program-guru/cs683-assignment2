@@ -2,7 +2,7 @@
 
 #define NUM_LEADER_SETS 32
 #define maxRRPV 3
-#define IRRIP_THRESHOLD 0.20
+#define IRRIP_THRESHOLD 0.30
 
 
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
