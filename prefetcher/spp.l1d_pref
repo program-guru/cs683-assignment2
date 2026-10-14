@@ -1,25 +1,77 @@
+// FYI: Code is purely handwritten. 
+// AI assistance used for logic correction and to add explanatory comments.
+
+/*
+ * ============================================================================
+ *  L1D Stride Pattern Prefetcher (per-edge confidence throttling)
+ * ============================================================================
+ *
+ *  HIGH-LEVEL IDEA
+ *  ---------------
+ *  Instead of just remembering "the last stride" per instruction pointer (IP),
+ *  this prefetcher learns *sequences of strides* (a Markov-like graph):
+ *
+ *      stride A  ->  stride B  ->  stride C ...
+ *
+ *  For every IP (tracker) we keep:
+ *    - A small set of recently seen strides (graph NODES).
+ *    - For every stride node, a small set of strides that were observed to
+ *      FOLLOW it (graph EDGES, stored in `next_strides`).
+ *
+ *  On each access we:
+ *    1. Compute the new stride (cache-line delta from the previous access).
+ *    2. Score the prediction we made last time (update edge confidence).
+ *    3. Learn the transition  (previous stride -> current stride).
+ *    4. Walk the graph depth-first from the current stride and issue
+ *       prefetches along the most-recently-used edges, throttling the number
+ *       of prefetches by how confident each edge is.
+ *
+ *  DATA STRUCTURE OVERVIEW
+ *  -----------------------
+ *    trackers (global LRU table, keyed by masked IP)
+ *      └─ Tracker_Element (one per IP)
+ *           ├─ last_cl_addr, last_stride   (state of the previous access)
+ *           └─ strides : LRU_Block<Stride_Element>   (graph nodes)
+ *                └─ Stride_Element
+ *                     ├─ next_strides : LRU_Block<Stride_Element> (graph edges)
+ *                     └─ confidence   (how reliable is this edge)
+ *
+ *  LRU CONVENTION
+ *  --------------
+ *  `lru == 0` means Most Recently Used; `lru == size-1` means Least Recently
+ *  Used (the eviction victim). Lower lru value == "more trusted/recent".
+ */
+
 #include "cache.h"
 #include <algorithm>
 #include <cstring>
 #include <vector>
 #include <functional>
 
-#define IP_TRACKER_COUNT 24
-#define MASK_IP 0xFF
-#define PAST_STRIDES 7
+// ----------------------------------------------------------------------------
+// Configuration knobs
+// ----------------------------------------------------------------------------
+#define IP_TRACKER_COUNT 24   // Number of IPs tracked simultaneously (size of the global tracker table)
+#define MASK_IP 0xFF          // Only the low 8 bits of the IP are used, so different IPs may alias to one tracker
+#define PAST_STRIDES 7        // Number of distinct strides remembered per tracker (graph nodes per IP)
 
+// --- Confidence / throttling parameters ---
 #define CONF_MAX          3    // saturating counter ceiling
 #define CONF_MIN          0    // saturating counter floor
 #define CONF_HIGH_THRESH  2    // confidence >= this -> aggressive
 #define CONF_LOW_THRESH   1    // confidence <= this -> minimal
-#define DEGREE_HIGH       4
-#define DEGREE_MED        3    
-#define DEGREE_LOW        1
+#define DEGREE_HIGH       4    // max prefetches for a high-confidence edge (also the initial DFS budget)
+#define DEGREE_MED        3    // prefetch budget for a medium-confidence edge
+#define DEGREE_LOW        1    // prefetch budget for a low-confidence edge
 
+// ============================================================================
+// LRU_Element: base class for anything stored in an LRU_Block.
+// Holds the key (unique_id) and the LRU age counter.
+// ============================================================================
 class LRU_Element {
 public:
-    int8_t lru;
-    uint64_t unique_id;
+    int8_t lru;           // Age rank within its block: 0 = MRU, (size-1) = LRU
+    uint64_t unique_id;   // Lookup key (e.g. masked IP for trackers, stride value for strides)
 
     LRU_Element(uint64_t unique_id) : unique_id(unique_id),
                                       lru(0) {}
@@ -28,11 +80,16 @@ public:
     virtual ~LRU_Element() = default;
 };
 
+// ============================================================================
+// LRU_Block<T>: a small fixed-size, fully-associative container with true LRU
+// replacement. Elements are heap-allocated and OWNED by the block (they are
+// deleted on eviction and when the block is destroyed).
+// ============================================================================
 template <typename T>
 class LRU_Block {
 private:
-    int size;
-    std::vector<T *> elements;
+    int size;                      // Fixed capacity (number of slots)
+    std::vector<T *> elements;     // Slot array; nullptr == empty slot
 
 public:
     LRU_Block(int s) : size(s) {
@@ -40,8 +97,6 @@ public:
         elements = std::vector<T *>(size, nullptr);
     }
 
-    // CHANGED: Added a destructor to clean up dynamically allocated elements
-    // when a tracker is evicted or destroyed.
     ~LRU_Block() {
         for (auto elem : elements) {
             if (elem)
@@ -49,11 +104,15 @@ public:
         }
     }
 
-    // CHANGED: Added getter to safely iterate over elements during prefetch generation
+    // NOTE: the returned vector may contain nullptr entries (empty slots), so
+    // callers must null-check each element.
     const std::vector<T *> &get_elements() const {
         return elements;
     }
 
+    // Look up `unique_id`; insert it if missing (evicting the LRU element if full).
+    // Either way, the returned element is promoted to MRU.
+    //
     // First Element: Pointer to the element with the unique_id
     // Second Element: True if the element was newly inserted, False if it already existed
     std::pair<T *, bool> insert(uint64_t unique_id) {
@@ -66,11 +125,13 @@ public:
             }
         }
 
-        // 2. Element not found, we need to insert and potentially evict
+        // 2. Element not found (loop ran off the end), we need to insert and potentially evict
         if (index == size) {
             int victim_idx = -1;
 
-            // CHANGED: Safely find an empty slot OR the LRU victim
+            // Safely find an empty slot OR the LRU victim
+            // Preference: an empty slot (stop immediately); otherwise the
+            // element whose lru equals size-1 (the oldest one).
             for (int i = 0; i < size; i++) {
                 if (!elements[i]) {
                     victim_idx = i; // Found an empty slot!
@@ -90,7 +151,7 @@ public:
             index = victim_idx; // Set index to our newly inserted element
 
             // Update LRUs: Since we inserted a new Most Recently Used (MRU = 0),
-            // all other existing elements age by 1.
+            // all other existing elements age by 1 (capped at size-1).
             for (int i = 0; i < size; i++) {
                 if (elements[i] && i != index && elements[i]->lru < size - 1) {
                     elements[i]->lru++;
@@ -102,7 +163,8 @@ public:
         }
 
         // 3. Element was found! We just need to update LRU states.
-        // CHANGED: Only age elements that are currently more recently used than the accessed element.
+        // Only age elements that are currently more recently used than the accessed element.
+        // (Elements older than the accessed one keep their rank, so ranks stay unique.)
         int current_lru = elements[index]->lru;
         for (int i = 0; i < size; i++) {
             if (elements[i] && elements[i]->lru < current_lru) {
@@ -115,37 +177,54 @@ public:
     }
 };
 
+// ============================================================================
+// Stride_Element: one node/edge in the stride graph.
+//   - As a NODE (stored in Tracker_Element::strides): represents a stride
+//     value that this IP has produced.
+//   - As an EDGE (stored in another Stride_Element's next_strides): represents
+//     "this stride was observed right after the parent stride".
+// The stride value itself is stored in `unique_id` (as an unsigned bit pattern).
+// ============================================================================
 class Stride_Element : public LRU_Element {
 public:
-    // CHANGED: Removed the `uint64_t& stride` reference. References inside objects
+    // References inside objects
     // prevent implicit assignment operators. Instead, we use a helper function to
     // cast the unsigned unique_id back to a signed integer.
+
+    // Strides observed immediately AFTER this one (outgoing edges, max 3).
+    // The LRU order here doubles as a "most likely successor first" ranking.
     LRU_Block<Stride_Element> next_strides;
 
-    // NEW: per-edge saturating confidence counter. Lives directly on the edge
+    // per-edge saturating confidence counter. Lives directly on the edge
     // this stride represents, so "how trustworthy is this specific predicted
     // transition" is tracked locally, with zero extra containers.
+    // Range: [CONF_MIN, CONF_MAX]. Incremented on a correct prediction,
+    // decremented on a wrong one.
     int8_t confidence;
 
     Stride_Element(uint64_t id) : LRU_Element(id),
                                   next_strides(3),
                                   confidence(0) {}
 
+    // Recover the signed stride (in cache lines) from the unsigned key.
     int64_t get_stride_val() const {
         return static_cast<int64_t>(unique_id);
     }
 };
 
+// ============================================================================
+// Tracker_Element: per-IP state. One entry in the global tracker table.
+// ============================================================================
 class Tracker_Element : public LRU_Element {
 public:
-    uint64_t last_cl_addr;
-    Stride_Element *last_stride;
-    LRU_Block<Stride_Element> strides;
+    uint64_t last_cl_addr;               // Cache-line address of this IP's previous access (used to compute the next stride)
+    Stride_Element *last_stride;         // Node for the stride seen on the previous access (source of the next learned edge)
+    LRU_Block<Stride_Element> strides;   // Graph nodes: the recently seen distinct strides for this IP
 
-    // NEW: what we predicted would be the *next* stride, so we can check it
+    // What we predicted would be the *next* stride, so we can check it
     // against reality on the following access and adjust that edge's confidence.
-    int64_t predicted_stride;
-    bool has_prediction;
+    int64_t predicted_stride;            // The stride we expect on the next access
+    bool has_prediction;                 // True only if predicted_stride is valid/pending verification
 
     Tracker_Element(uint64_t id) : LRU_Element(id),
                                    last_cl_addr(0),
@@ -155,24 +234,28 @@ public:
                                    has_prediction(false) {}
 };
 
-// Global Table
+// Global Table: maps (masked) IP -> Tracker_Element with LRU replacement.
 LRU_Block<Tracker_Element> trackers(IP_TRACKER_COUNT);
 
 void CACHE::l1d_prefetcher_initialize() {
     cout << "CPU " << cpu << " L1D Stride Pattern Prefetcher (per-edge confidence throttling)" << endl;
 }
 
+// Called on every L1D access. Learns stride transitions and issues prefetches.
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag) {
-    // Cache Line Index
+    // Cache Line Index (drop the byte-offset-within-line bits)
     uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
 
     // Strip the IP down to a smaller size to reduce the number of trackers we need to maintain
     ip = ip & MASK_IP;
 
+    // Find (or allocate, evicting the LRU tracker) the tracker for this IP
     auto tracker_result = trackers.insert(ip);
     Tracker_Element* tracker = tracker_result.first;
     bool is_new_tracker = tracker_result.second;
 
+    // First time we see this IP: there is no previous address, so no stride yet.
+    // Just record the address and wait for the next access.
     if (is_new_tracker) {
         tracker->last_cl_addr = cl_addr;
         tracker->last_stride = nullptr;
@@ -180,7 +263,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         return;
     }
 
-    // Calculate stride
+    // Calculate stride: signed distance (in cache lines) from this IP's last access
     int64_t stride = static_cast<int64_t>(cl_addr) - static_cast<int64_t>(tracker->last_cl_addr);
 
     // No spatial movement, nothing to prefetch or learn.
@@ -188,12 +271,17 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         return;
     }
 
+    // ------------------------------------------------------------------
+    // CONFIDENCE UPDATE: verify the previous prediction
+    // ------------------------------------------------------------------
     // Before touching last_stride for this access, check whether what we
     // predicted last time actually happened, and adjust that edge's
     // confidence accordingly.
     if (tracker->has_prediction && tracker->last_stride != nullptr) {
         bool correct = (stride == tracker->predicted_stride);
 
+        // The edge we followed lives in last_stride's successor list.
+        // Find it by stride value and nudge its saturating counter.
         for (auto edge : tracker->last_stride->next_strides.get_elements()) {
             if (edge && edge->get_stride_val() == tracker->predicted_stride) {
                 if (correct) {
@@ -206,10 +294,15 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
     }
 
+    // ------------------------------------------------------------------
+    // LEARNING: record the current stride as a node
+    // ------------------------------------------------------------------
+    // Find or insert the node for the current stride (promotes it to MRU).
     auto stride_result = tracker->strides.insert(stride);
     Stride_Element* stride_element = stride_result.first;
 
     // Link the previous stride to this stride (Learning phase)
+    // i.e. add/refresh the edge  last_stride -> stride.
     if(tracker->last_stride != nullptr) {
         tracker->last_stride->next_strides.insert(stride);
     }
@@ -220,11 +313,17 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
     // --- PREFETCH GENERATION (DFS Lookahead Mechanism) ---
 
+    // Total prefetches issued during this single access (shared across the
+    // whole recursive walk, captured by reference in the lambda below).
     int prefetches_issued = 0;
     std::function<void(Stride_Element*, uint64_t, int)> dfs_lookahead;
 
     // Recursive lambda for DFS traversal. `degree_budget` is the per-call
     // throttled degree, derived from the confidence of the edge being followed.
+    //   current_state    : stride node we are currently "standing on"
+    //   current_spec_cl  : speculative cache-line address after applying the
+    //                      strides along the path so far
+    //   degree_budget    : cap on the TOTAL prefetches issued (not per level)
     dfs_lookahead = [&](Stride_Element* current_state, uint64_t current_spec_cl, int degree_budget) -> void {
         // Base case: Stop if we've reached our (confidence-derived) prefetch budget
         if (prefetches_issued >= degree_budget) {
@@ -232,6 +331,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
 
         // 1. Gather all valid outgoing edges (next strides)
+        // (skip empty slots, which are nullptr)
         std::vector<Stride_Element*> next_edges;
         for (auto ns : current_state->next_strides.get_elements()) {
             if (ns) {
@@ -241,6 +341,8 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
         // 2. Sort edges by LRU (ascending).
         // This ensures we always try the most confident (lowest LRU) path first.
+        // (Here "confident" means most recently observed successor; the
+        // explicit `confidence` counter is applied separately in step 3.)
         std::sort(next_edges.begin(), next_edges.end(), [](Stride_Element* a, Stride_Element* b) {
             return a->lru < b->lru;
         });
@@ -251,22 +353,29 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
                 break;
             }
 
-            // NEW: let this specific edge's confidence set its own degree
+            // Let this specific edge's confidence set its own degree
             // budget. A low-confidence edge gets throttled on the spot
             // instead of relying on one global accuracy number.
+            //   conf >= HIGH_THRESH -> DEGREE_HIGH
+            //   conf <= LOW_THRESH  -> DEGREE_LOW
+            //   otherwise           -> DEGREE_MED
             int edge_degree = (edge->confidence >= CONF_HIGH_THRESH) ? DEGREE_HIGH
                              : (edge->confidence <= CONF_LOW_THRESH)  ? DEGREE_LOW
                                                                       : DEGREE_MED;
+            // The budget can only shrink as we go deeper: take the stricter of
+            // the inherited budget and this edge's own degree.
             int effective_budget = std::min(degree_budget, edge_degree);
             if (prefetches_issued >= effective_budget) {
                 continue; // this low-confidence edge is throttled away; try the next one
             }
 
+            // Apply the predicted stride to the speculative address to get the prefetch target
             int64_t next_stride_val = edge->get_stride_val();
             uint64_t next_spec_cl = current_spec_cl + next_stride_val;
             uint64_t pf_addr = next_spec_cl << LOG2_BLOCK_SIZE;
 
             // Check Page Boundary
+            // (prefetches must stay within the same page as the triggering access)
             if ((pf_addr >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) {
                 // Instead of aborting the whole lookahead, we backtrack and try
                 // the next best stride in our sorted list.
@@ -274,6 +383,8 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             }
 
             // Issue the prefetch
+            // If the MSHR is less than half full, fill into L1; otherwise fill
+            // only into L2 to avoid pressuring the L1 miss-handling resources.
             if (MSHR.occupancy < (MSHR.SIZE >> 1)) {
                 prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
             } else {
@@ -284,12 +395,17 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
             // Remember this as the prediction to verify on the tracker's NEXT access
             // (only the immediate next-level guess is checkable this way).
+            // Deeper levels can't be verified until several accesses later, so
+            // only the first hop from the current stride is recorded.
             if (current_state == stride_element) {
                 tracker->predicted_stride = next_stride_val;
                 tracker->has_prediction = true;
             }
 
             // 4. Find the state corresponding to this stride to continue DFS
+            // The edge object is just a successor record; the node with the
+            // same stride value in tracker->strides holds the next level of
+            // successors, so we look it up by value.
             Stride_Element* next_state = nullptr;
             for (auto s : tracker->strides.get_elements()) {
                 if (s && s->get_stride_val() == next_stride_val) {
@@ -309,6 +425,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
     // If this access produced no outgoing edges to predict from, clear the
     // pending prediction so a stale guess isn't checked next time.
+    // (Otherwise the confidence of an unrelated edge could be wrongly updated.)
     if (stride_element->next_strides.get_elements().empty()) {
         tracker->has_prediction = false;
     }
@@ -318,9 +435,11 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     dfs_lookahead(stride_element, cl_addr, DEGREE_HIGH);
 }
 
+// No action needed on cache fills for this prefetcher.
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in) {
     return;
 }
 
+// No statistics are reported at the end of simulation.
 void CACHE::l1d_prefetcher_final_stats() {
 }
