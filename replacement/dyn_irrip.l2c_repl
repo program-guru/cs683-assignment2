@@ -1,0 +1,227 @@
+#include "cache.h"
+#include <cstdlib>
+#include <cstdint>
+
+#define NUM_LEADER_SETS 32
+#define maxRRPV 3
+
+/* 
+    Default threshold, can be overridden at runtime using
+    DYN_IRRIP_THRESHOLD=0.15, 0.20, 0.25, 0.30, or 0.35.
+*/
+double IRRIP_THRESHOLD = 0.20;
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+uint8_t l2_is_instruction[L2C_SET][L2C_WAY];
+
+uint64_t leader_instr_accesses = 0;
+uint64_t leader_data_accesses = 0;
+uint64_t leader_instr_misses = 0;
+uint64_t leader_data_misses = 0;
+
+
+// Read threshold from environment variable.
+void initialize_irrip_threshold()
+{
+    const char* env = std::getenv("DYN_IRRIP_THRESHOLD");
+
+    if (env != nullptr) {
+        char* end = nullptr;
+        double value = std::strtod(env, &end);
+
+        if (end != env && *end == '\0' &&
+            value >= 0.0 && value <= 1.0) {
+            IRRIP_THRESHOLD = value;
+        } else {
+            cout << "WARNING: Invalid DYN_IRRIP_THRESHOLD='"
+                 << env << "'. Using default "
+                 << IRRIP_THRESHOLD << endl;
+        }
+    }
+
+    cout << "Configured IRRIP threshold: "
+         << IRRIP_THRESHOLD << endl;
+}
+
+
+bool is_leader_set(uint32_t set)
+{
+    return (set % NUM_LEADER_SETS) == 0;
+}
+
+
+// Decide whether nonleader sets should use I-RRIP.
+bool use_irrip()
+{
+    uint64_t total = leader_instr_accesses + leader_data_accesses + leader_instr_misses + leader_data_misses;
+
+    if (total == 0)
+        return false;
+
+    double score = (double)(leader_instr_accesses + leader_instr_misses) / total;
+
+    return score > IRRIP_THRESHOLD;
+}
+
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    initialize_irrip_threshold();
+
+    cout << NAME << " has Dynamic I-RRIP replacement policy"<< endl;
+
+    for (int i=0; i<L2C_SET; i++) {
+        for (int j=0; j<L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instruction[i][j] = 0;
+        }
+    }
+
+    // Reset counters in case the cache is reinitialized.
+    leader_instr_accesses = 0;
+    leader_data_accesses = 0;
+    leader_instr_misses = 0;
+    leader_data_misses = 0;
+}
+
+
+// find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // Leader sets use normal RRIP.
+    // Nonleader sets use normal RRIP until I-RRIP is selected.
+    if (is_leader_set(set) || !use_irrip()) {
+        // look for the maxRRPV line
+        while (1)
+        {
+            for (int i=0; i<L2C_WAY; i++)
+                if (l2_rrpv[set][i] == maxRRPV)
+                    return i;
+
+            for (int i=0; i<L2C_WAY; i++)
+                    l2_rrpv[set][i]++;
+            }
+        // WE SHOULD NOT REACH HERE
+        assert(0);
+        return 0;
+    }
+    while (1)
+    {
+        int instruction_victim=-1;
+        // look for the maxRRPV line
+        for (int i=0; i<L2C_WAY; i++){
+            if (l2_rrpv[set][i] == maxRRPV){
+                if(l2_is_instruction[set][i]==0)
+                    return i;
+
+                instruction_victim = i;
+            }
+        }
+
+        // All eligible victims are instruction lines, so we evict an instruction line
+        if (instruction_victim != -1)
+            return instruction_victim;
+
+        // Age lines until at least one reaches maxRRPV.
+        for (int i=0; i<L2C_WAY; i++)
+            if (l2_rrpv[set][i] < maxRRPV)
+                l2_rrpv[set][i]++;
+
+    }
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+
+// Called on every cache hit and cache fill.
+void CACHE::l2c_update_replacement_state(
+    uint32_t cpu,
+    uint32_t set,
+    uint32_t way,
+    uint64_t full_addr,
+    uint64_t ip,
+    uint64_t victim_addr,
+    uint32_t type,
+    uint8_t hit,
+    uint8_t isInstruction)
+{
+    // Collect statistics from leader sets.
+    if (is_leader_set(set)) {
+        if (isInstruction)
+            leader_instr_accesses++;
+        else
+            leader_data_accesses++;
+
+        if (!hit) {
+            if (isInstruction)
+                leader_instr_misses++;
+            else
+                leader_data_misses++;
+        }
+    }
+
+    bool irrip = !is_leader_set(set) && use_irrip();
+
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else if (type == LOAD_TRANSLATION)
+	TYPE_NAME = "L_TN";
+    else if (type == PREFETCH_TRANSLATION)
+	TYPE_NAME = "P_TN";
+    else if (type == TRANSLATION_FROM_L1D)
+	TYPE_NAME = "TN_L1D";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // uncomment this line to see the L2C accesses
+    // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
+    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
+
+    if (hit) {
+        // Hit promotion.
+        if (irrip) {
+            // Give instruction lines stronger protection.
+            if (l2_is_instruction[set][way])
+                l2_rrpv[set][way] = 0;
+            else
+                l2_rrpv[set][way] = 1;
+        } else {
+            // Normal RRIP promotion.
+            l2_rrpv[set][way] = 0;
+        }
+    } else {
+        // Record whether the incoming line is an instruction.
+        l2_is_instruction[set][way] = isInstruction;
+
+        if (irrip && isInstruction) {
+            // Insert instruction lines with stronger protection.
+            l2_rrpv[set][way] = maxRRPV - 2;
+        } else {
+            // Normal data insertion, or RRIP-mode insertion.
+            l2_rrpv[set][way] = maxRRPV - 1;
+        }
+    }
+}
+
+
+void CACHE::l2c_replacement_final_stats()
+{
+   
+}
