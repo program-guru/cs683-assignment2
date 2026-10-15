@@ -1,0 +1,25 @@
+experiment,source_file,trace,policy,threshold,ipc,l2c_load_mpki,l2_instr_mpki,l2_data_mpki
+dyn_irrip_t015_trace1,dyn_irrip_t015_trace1.txt,trace1,Dynamic I-RRIP,0.15,0.232244,17.609,9.92252,7.68648
+dyn_irrip_t015_trace2,dyn_irrip_t015_trace2.txt,trace2,Dynamic I-RRIP,0.15,0.256127,22.4848,13.4644,9.02036
+dyn_irrip_t015_trace3,dyn_irrip_t015_trace3.txt,trace3,Dynamic I-RRIP,0.15,0.381991,3.90364,1.03004,2.8736
+dyn_irrip_t020_trace1,dyn_irrip_t020_trace1.txt,trace1,Dynamic I-RRIP,0.2,0.232261,17.6018,9.91816,7.6836
+dyn_irrip_t020_trace2,dyn_irrip_t020_trace2.txt,trace2,Dynamic I-RRIP,0.2,0.256169,22.4788,13.4648,9.014
+dyn_irrip_t020_trace3,dyn_irrip_t020_trace3.txt,trace3,Dynamic I-RRIP,0.2,0.381995,3.90268,1.03028,2.8724
+dyn_irrip_t025_trace1,dyn_irrip_t025_trace1.txt,trace1,Dynamic I-RRIP,0.25,0.232238,17.6161,9.93388,7.6822
+dyn_irrip_t025_trace2,dyn_irrip_t025_trace2.txt,trace2,Dynamic I-RRIP,0.25,0.25615,22.4865,13.4704,9.01612
+dyn_irrip_t025_trace3,dyn_irrip_t025_trace3.txt,trace3,Dynamic I-RRIP,0.25,0.382013,3.90452,1.03068,2.87384
+dyn_irrip_t030_trace1,dyn_irrip_t030_trace1.txt,trace1,Dynamic I-RRIP,0.3,0.232242,17.6194,9.93416,7.68528
+dyn_irrip_t030_trace2,dyn_irrip_t030_trace2.txt,trace2,Dynamic I-RRIP,0.3,0.256136,22.4768,13.4526,9.02424
+dyn_irrip_t030_trace3,dyn_irrip_t030_trace3.txt,trace3,Dynamic I-RRIP,0.3,0.381971,3.90372,1.02984,2.87388
+dyn_irrip_t035_trace1,dyn_irrip_t035_trace1.txt,trace1,Dynamic I-RRIP,0.35,0.23234,17.5294,10.2331,7.29636
+dyn_irrip_t035_trace2,dyn_irrip_t035_trace2.txt,trace2,Dynamic I-RRIP,0.35,0.255611,22.8871,13.8825,9.0046
+dyn_irrip_t035_trace3,dyn_irrip_t035_trace3.txt,trace3,Dynamic I-RRIP,0.35,0.381771,4.00988,1.1408,2.86908
+irrip_trace1,irrip_trace1.txt,trace1,I-RRIP,,0.232239,17.615,9.90608,7.70892
+irrip_trace2,irrip_trace2.txt,trace2,I-RRIP,,0.25637,22.353,13.2912,9.06188
+irrip_trace3,irrip_trace3.txt,trace3,I-RRIP,,0.381975,3.8994,1.02368,2.87572
+lru_trace1,lru_trace1.txt,trace1,LRU,,0.232345,17.6956,10.3377,7.35796
+lru_trace2,lru_trace2.txt,trace2,LRU,,0.251158,27.3568,18.8533,8.50352
+lru_trace3,lru_trace3.txt,trace3,LRU,,0.382065,3.95424,1.12408,2.83016
+rrip_trace1,rrip_trace1.txt,trace1,RRIP,,0.232231,17.6387,10.5618,7.07688
+rrip_trace2,rrip_trace2.txt,trace2,RRIP,,0.251806,25.7458,17.7813,7.96452
+rrip_trace3,rrip_trace3.txt,trace3,RRIP,,0.381739,4.03948,1.19704,2.84244

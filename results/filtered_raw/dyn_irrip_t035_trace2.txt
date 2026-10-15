@@ -1,0 +1,36 @@
+Configured IRRIP threshold: 0.35
+L2C has Dynamic I-RRIP replacement policy
+Heartbeat CPU 0 instructions: 10000000 cycles: 2974803 heartbeat IPC: 3.36157 cumulative IPC: 3.36157 (Simulation time: 0 hr 0 min 13 sec) 
+Heartbeat CPU 0 instructions: 20000001 cycles: 5829934 heartbeat IPC: 3.50247 cumulative IPC: 3.43057 (Simulation time: 0 hr 0 min 27 sec) 
+Heartbeat CPU 0 instructions: 30000000 cycles: 26637970 heartbeat IPC: 0.480584 cumulative IPC: 0.257885 (Simulation time: 0 hr 0 min 46 sec) 
+Heartbeat CPU 0 instructions: 40000002 cycles: 60283053 heartbeat IPC: 0.29722 cumulative IPC: 0.28284 (Simulation time: 0 hr 1 min 9 sec) 
+Heartbeat CPU 0 instructions: 50000000 cycles: 105054553 heartbeat IPC: 0.223356 cumulative IPC: 0.25561 (Simulation time: 0 hr 1 min 35 sec) 
+Finished CPU 0 instructions: 25000001 cycles: 97805050 cumulative IPC: 0.255611 (Simulation time: 0 hr 1 min 35 sec) 
+CPU 0 cumulative IPC: 0.255611 instructions: 25000001 cycles: 97805050
+STLB Hit, L2C data hit: 0
+STLB STLB hints to L2: 0
+L1D PREFETCHES PUSHED FROM L2C: 0
+L2C TOTAL     ACCESS:    1788490  HIT:    1036696  MISS:     751794  HIT %:    57.9649  MISS %:    42.0351   MPKI: 30.0718
+L2C LOAD      ACCESS:    1339098  HIT:     766920  MISS:     572178  HIT %:    57.2714  MISS %:    42.7286   MPKI: 22.8871
+L2C DATA LOAD MPKI: 9.0046
+L2C INSTRUCTION LOAD MPKI: 13.8825
+L2C RFO       ACCESS:     129815  HIT:      47937  MISS:      81878  HIT %:    36.9272  MISS %:    63.0728   MPKI: 3.27512
+L2C WRITEBACK ACCESS:     206055  HIT:     167146  MISS:      38909  HIT %:    81.1172  MISS %:    18.8828   MPKI: 1.55636
+L2C LOAD TRANSLATION ACCESS:     113522  HIT:      54693  MISS:      58829  HIT %:    48.1783  MISS %:    51.8217   MPKI: 2.35316
+L2C PREFETCH  REQUESTED:          0  ISSUED:          0  USEFUL:          0  USELESS:          0
+L2C USEFUL LOAD PREFETCHES:          0 PREFETCH ISSUED TO LOWER LEVEL:          0  ACCURACY: -nan
+L2C TIMELY PREFETCHES:          0 LATE PREFETCHES: 0 DROPPED PREFETCHES: 0
+L2C PREFETCHES SAME FILL-ORIGIN LEVEL: 0 DIFFERENT FILL-ORIGIN LEVEL: 0
+L2C AVERAGE MISS LATENCY: 95.6881 cycles
+L2C RQ	ACCESS:    1582440	FORWARD:          0	MERGED:          0	TO_CACHE:    1582435
+L2C WQ	ACCESS:     206055	FORWARD:          5	MERGED:          0	TO_CACHE:     206055
+L2C Instructions Evicting Data 131444
+L2C Translations Evicting Data 29516
+L2C Data Evicting Data 174656
+L2C Instructions Evicting Instructions 191306
+L2C Translations Evicting Instructions 23824
+L2C Data Evicting Instructions 106497
+L2C Instructions Evicting Translations 24313
+L2C Translations Evicting Translations 5489
+L2C Data Evicting Translations 25840
+L2C Dense regions hint from L2: 0
