@@ -1,18 +1,48 @@
 #include "cache.h"
+#include <cstdlib>
+#include <cstdint>
 
 #define NUM_LEADER_SETS 32
 #define maxRRPV 3
-#define IRRIP_THRESHOLD 0.30
 
+/* 
+    Default threshold, can be overridden at runtime using
+    DYN_IRRIP_THRESHOLD=0.15, 0.20, 0.25, 0.30, or 0.35.
+*/
+double IRRIP_THRESHOLD = 0.20;
 
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 uint8_t l2_is_instruction[L2C_SET][L2C_WAY];
 
 uint64_t leader_instr_accesses = 0;
 uint64_t leader_data_accesses = 0;
-
 uint64_t leader_instr_misses = 0;
 uint64_t leader_data_misses = 0;
+
+
+// Read threshold from environment variable.
+void initialize_irrip_threshold()
+{
+    const char* env = std::getenv("DYN_IRRIP_THRESHOLD");
+
+    if (env != nullptr) {
+        char* end = nullptr;
+        double value = std::strtod(env, &end);
+
+        if (end != env && *end == '\0' &&
+            value >= 0.0 && value <= 1.0) {
+            IRRIP_THRESHOLD = value;
+        } else {
+            cout << "WARNING: Invalid DYN_IRRIP_THRESHOLD='"
+                 << env << "'. Using default "
+                 << IRRIP_THRESHOLD << endl;
+        }
+    }
+
+    cout << "Configured IRRIP threshold: "
+         << IRRIP_THRESHOLD << endl;
+}
+
 
 bool is_leader_set(uint32_t set)
 {
@@ -20,6 +50,7 @@ bool is_leader_set(uint32_t set)
 }
 
 
+// Decide whether nonleader sets should use I-RRIP.
 bool use_irrip()
 {
     uint64_t total = leader_instr_accesses + leader_data_accesses + leader_instr_misses + leader_data_misses;
@@ -36,20 +67,31 @@ bool use_irrip()
 // initialize replacement state
 void CACHE::l2c_initialize_replacement()
 {
-    cout << NAME << " has D-RRIP replacement policy" << endl;
+    initialize_irrip_threshold();
+
+    cout << NAME << " has Dynamic I-RRIP replacement policy"<< endl;
+
     for (int i=0; i<L2C_SET; i++) {
         for (int j=0; j<L2C_WAY; j++) {
             l2_rrpv[i][j] = maxRRPV;
             l2_is_instruction[i][j] = 0;
         }
     }
+
+    // Reset counters in case the cache is reinitialized.
+    leader_instr_accesses = 0;
+    leader_data_accesses = 0;
+    leader_instr_misses = 0;
+    leader_data_misses = 0;
 }
 
 
 // find replacement victim
 uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
 {
-    if (is_leader_set(set) || !use_irrip()){
+    // Leader sets use normal RRIP.
+    // Nonleader sets use normal RRIP until I-RRIP is selected.
+    if (is_leader_set(set) || !use_irrip()) {
         // look for the maxRRPV line
         while (1)
         {
@@ -58,8 +100,8 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
                     return i;
 
             for (int i=0; i<L2C_WAY; i++)
-                l2_rrpv[set][i]++;
-        }
+                    l2_rrpv[set][i]++;
+            }
         // WE SHOULD NOT REACH HERE
         assert(0);
         return 0;
@@ -72,12 +114,20 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
             if (l2_rrpv[set][i] == maxRRPV){
                 if(l2_is_instruction[set][i]==0)
                     return i;
-                else instruction_victim=i;
+
+                instruction_victim = i;
             }
         }
-        if(instruction_victim!=-1) return instruction_victim;
+
+        // All eligible victims are instruction lines, so we evict an instruction line
+        if (instruction_victim != -1)
+            return instruction_victim;
+
+        // Age lines until at least one reaches maxRRPV.
         for (int i=0; i<L2C_WAY; i++)
-            l2_rrpv[set][i]++;
+            if (l2_rrpv[set][i] < maxRRPV)
+                l2_rrpv[set][i]++;
+
     }
     // WE SHOULD NOT REACH HERE
     assert(0);
@@ -85,10 +135,19 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
 }
 
 
-// called on every cache hit and cache fill
-void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+// Called on every cache hit and cache fill.
+void CACHE::l2c_update_replacement_state(
+    uint32_t cpu,
+    uint32_t set,
+    uint32_t way,
+    uint64_t full_addr,
+    uint64_t ip,
+    uint64_t victim_addr,
+    uint32_t type,
+    uint8_t hit,
+    uint8_t isInstruction)
 {
-    // Update statistics for leader sets
+    // Collect statistics from leader sets.
     if (is_leader_set(set)) {
         if (isInstruction)
             leader_instr_accesses++;
@@ -102,6 +161,7 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
                 leader_data_misses++;
         }
     }
+
     bool irrip = !is_leader_set(set) && use_irrip();
 
     string TYPE_NAME;
@@ -133,85 +193,35 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     // uncomment this line to see the L2C accesses
     // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
     // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
-    
-    if (hit) {
 
+    if (hit) {
+        // Hit promotion.
         if (irrip) {
-            // Prioritize Instruction
+            // Give instruction lines stronger protection.
             if (l2_is_instruction[set][way])
                 l2_rrpv[set][way] = 0;
             else
                 l2_rrpv[set][way] = 1;
-        }
-        else {
-            // Normal RRIP promotion
+        } else {
+            // Normal RRIP promotion.
             l2_rrpv[set][way] = 0;
         }
-
-    }
-    else {
-
+    } else {
+        // Record whether the incoming line is an instruction.
         l2_is_instruction[set][way] = isInstruction;
 
-        if (irrip && isInstruction)
-            l2_rrpv[set][way] = maxRRPV-2;
-        else
-            l2_rrpv[set][way] = maxRRPV-1;
+        if (irrip && isInstruction) {
+            // Insert instruction lines with stronger protection.
+            l2_rrpv[set][way] = maxRRPV - 2;
+        } else {
+            // Normal data insertion, or RRIP-mode insertion.
+            l2_rrpv[set][way] = maxRRPV - 1;
+        }
     }
 }
 
-// use this function to print out your own stats at the end of simulation
+
 void CACHE::l2c_replacement_final_stats()
 {
-    uint64_t total_accesses =
-        leader_instr_accesses + leader_data_accesses;
-
-    uint64_t total_misses =
-        leader_instr_misses + leader_data_misses;
-
-    uint64_t total =
-        total_accesses + total_misses;
-
-    double score = 0.0;
-
-    if (total > 0) {
-        score = (double)(leader_instr_accesses + leader_instr_misses)
-              / (double)total;
-    }
-
-    cout << endl;
-    cout << "========== Dynamic I-RRIP Statistics ==========" << endl;
-
-    cout << "Number of leader sets:       " << NUM_LEADER_SETS << endl;
-
-    cout << "Leader instruction accesses: "
-         << leader_instr_accesses << endl;
-
-    cout << "Leader data accesses:        "
-         << leader_data_accesses << endl;
-
-    cout << "Leader instruction misses:   "
-         << leader_instr_misses << endl;
-
-    cout << "Leader data misses:          "
-         << leader_data_misses << endl;
-
-    cout << "-----------------------------------------------" << endl;
-
-    cout << "Total leader accesses:       "
-         << total_accesses << endl;
-
-    cout << "Total leader misses:         "
-         << total_misses << endl;
-
-    cout << "Instruction score:           "
-         << score << endl;
-
-    cout << "IRRIP threshold:             "
-         << IRRIP_THRESHOLD << endl;
-
-    cout << "Final replacement mode:      "
-         << (score > IRRIP_THRESHOLD ? "IRRIP" : "RRIP") << endl;
-
-    cout << "===============================================" << endl;
+   
 }

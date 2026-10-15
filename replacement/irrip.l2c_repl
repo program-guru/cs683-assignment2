@@ -27,9 +27,14 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
             if (l2_rrpv[set][i] == maxRRPV){
                 if(l2_is_instruction[set][i]==0)
                     return i;
+                // storing the index of instruction line with RRPV=3
                 else k=i;
             }
         }
+        /*
+            if we reach here then there was no data line to evict
+            so we have to check if there are any instruction line taht can be evicted
+        */
         if(k!=-1) return k;
         for (int i=0; i<L2C_WAY; i++)
             l2_rrpv[set][i]++;
@@ -75,9 +80,9 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     
     if (hit)
         if (l2_is_instruction[set][way])
-            l2_rrpv[set][way] = 0; // update with RRPV0 for instruction
+            l2_rrpv[set][way] = 0; // update with RRPV=0 for instruction
         else    
-            l2_rrpv[set][way] = 1;  // update with RRPV1 for data
+            l2_rrpv[set][way] = 1;  // update with RRPV=1 for data
     else
         if(isInstruction){
             l2_rrpv[set][way] = maxRRPV-2;  // insert with RRPV1 for instruction
